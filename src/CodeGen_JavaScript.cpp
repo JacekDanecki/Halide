@@ -317,6 +317,8 @@ if (typeof(_halide_buffer_get_dimensions) !== "function" ||
   typeof(_halide_buffer_init_from_buffer) !== "function" ||
   typeof(_halide_buffer_set_bounds) !== "function") {
   (function () {
+    // TODO: these are intended to be adequate standalone replacements
+    // for the ones baked into the JIT support, but have not been tested.
     _halide_buffer_create = function() {
         return {
             host: null,
@@ -413,15 +415,14 @@ if (typeof(_halide_buffer_get_dimensions) !== "function" ||
                                          dimensions,
                                          shape,
                                          flags) {
-        // assert(dst_shape == dst.dim)
-        // assert(dimensions == dst.dim.length)
+        // dst_shape is always ignored in JS
         // assert(dimensions == shape.length)
-        _halide_buffer_init_shape(dst, dimensions);
         dst.host = host;
         dst.device = device;
         dst.device_interface = device_interface;
         dst.type_code = type_code;
         dst.type_bits = type_bits;
+        _halide_buffer_init_shape(dst, dimensions);
         for (var i = 0; i < dst.dim.length; i++) {
             dst.dim[i].min    = shape[i*4 + 0];
             dst.dim[i].extent = shape[i*4 + 1];
@@ -433,15 +434,14 @@ if (typeof(_halide_buffer_get_dimensions) !== "function" ||
     }
 
     _halide_buffer_init_from_buffer = function(dst, dst_shape, src) {
-        // assert(dst_shape == dst.dim)
+        // dst_shape is always ignored in JS
         // assert(src.dim.length == dst.dim.length)
-        _halide_buffer_init_shape(dst, src.dim.length);
         dst.host = src.host;
         dst.device = src.device;
         dst.device_interface = src.device_interface;
         dst.type_code = src.type_code;
         dst.type_bits = src.type_bits;
-        dst.dim = dst_shape;
+        _halide_buffer_init_shape(dst, src.dim.length);
         for (var i = 0; i < dst.dim.length; i++) {
             dst.dim[i].min    = src.dim[i].min;
             dst.dim[i].extent = src.dim[i].extent;
@@ -1586,8 +1586,7 @@ void CodeGen_JavaScript::visit(const Call *op) {
         const Call *call = op->args[0].as<Call>();
         if (op->type == type_of<struct halide_buffer_t *>() &&
             call && call->is_intrinsic(Call::size_of_halide_buffer_t)) {
-            print_assignment(op->type, "_halide_buffer_create()");
-            return;
+            rhs << "_halide_buffer_create()";
         } else {
             const int bytes = op->type.bytes();
             do_indent();
@@ -1595,6 +1594,14 @@ void CodeGen_JavaScript::visit(const Call *op) {
             string typed_array_name = javascript_type_array_name_fragment(op->type) + "Array";
             rhs << "new " << typed_array_name << "(" << alloc_size << ")";
         }
+
+        // don't fall thru and call print_assignment: it could re-use
+        // a cached, value, which is never appopriate for alloca calls.
+        id = unique_name('_');
+        do_indent();
+        stream << "var " << id << " = " << rhs.str() << ";\n";
+        return;
+
     } else if (op->is_intrinsic(Call::size_of_halide_buffer_t)) {
         internal_assert(op->args.size() == 0);
         rhs << sizeof(halide_buffer_t);

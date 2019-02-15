@@ -510,9 +510,10 @@ MangledNames get_mangled_names(const LoweredFunc &f, const Target &target) {
 // Make a wrapper to call the function with an array of pointer
 // args. This is easier for the JIT to call than a function with an
 // unknown (at compile time) argument list.
-llvm::Function *CodeGen_LLVM::add_argv_wrapper(llvm::Function *fn, const std::string &name,
+llvm::Function *CodeGen_LLVM::add_argv_wrapper(llvm::Function *fn,
+                                               const std::string &name,
                                                ARGVWrapperReturnResultKind result_kind) {
-    llvm::Type *buffer_t_type = module->getTypeByName("struct.buffer_t");
+    llvm::Type *buffer_t_type = module->getTypeByName("struct.halide_buffer_t");
     llvm::Type *i8 = llvm::Type::getInt8Ty(module->getContext());
     llvm::Type *i32 = llvm::Type::getInt32Ty(module->getContext());
     llvm::Type *void_type = llvm::Type::getVoidTy(module->getContext());
@@ -526,7 +527,6 @@ llvm::Function *CodeGen_LLVM::add_argv_wrapper(llvm::Function *fn, const std::st
     builder.SetInsertPoint(block);
 
     llvm::Value *arg_array = iterator_to_pointer(wrapper->arg_begin());
-
     std::vector<llvm::Value *> wrapper_args;
     for (llvm::Function::arg_iterator i = fn->arg_begin(); i != fn->arg_end(); i++) {
         // Get the address of the nth argument
@@ -562,7 +562,8 @@ llvm::Function *CodeGen_LLVM::add_argv_wrapper(llvm::Function *fn, const std::st
 }
 
 llvm::Function *CodeGen_LLVM::add_argv_wrapper(llvm::FunctionType *fn_type,
-                                               const std::string &wrapper_name, const std::string &callee_name,
+                                               const std::string &wrapper_name,
+                                               const std::string &callee_name,
                                                ARGVWrapperReturnResultKind result_kind) {
     llvm::Function *callee = llvm::Function::Create(fn_type, llvm::Function::ExternalLinkage, callee_name, module.get());
     return add_argv_wrapper(callee, wrapper_name, result_kind);

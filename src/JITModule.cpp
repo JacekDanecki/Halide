@@ -374,7 +374,8 @@ void JITModule::compile_module(std::unique_ptr<llvm::Module> m, const string &fu
     jit_module->name = function_name;
 }
 
-JITModule JITModule::make_trampolines_module(const Target &target_arg, const std::map<std::string, JITExtern> &externs,
+JITModule JITModule::make_trampolines_module(const Target &target_arg,
+                                             const std::map<std::string, JITExtern> &externs,
                                              const std::string &suffix,
                                              const std::vector<JITModule> &deps) {
     Target target = target_arg;
@@ -385,11 +386,12 @@ JITModule JITModule::make_trampolines_module(const Target &target_arg, const std
     codegen->init_for_codegen("trampolines");
     std::vector<std::string> requested_exports;
     for (const std::pair<std::string, JITExtern> &extern_entry : externs) {
-        Symbol sym = result.add_extern_for_export(extern_entry.first, extern_entry.second.extern_c_function());
+        const std::string &name = extern_entry.first;
+        Symbol sym = result.add_extern_for_export(name, extern_entry.second.extern_c_function());
         codegen->add_argv_wrapper(cast<llvm::FunctionType>(sym.llvm_type),
-                                  extern_entry.first + suffix, extern_entry.first,
+                                  name + suffix, name,
                                   CodeGen_LLVM::LastArgPointsToResult);
-        requested_exports.push_back(extern_entry.first + suffix);
+        requested_exports.push_back(name + suffix);
     }
     result.compile_module(codegen->finalize_module(), "", target, deps,
                           requested_exports);

@@ -195,23 +195,18 @@ class HalideArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
   virtual void Free(void* data, size_t) { free(data); }
 };
 
-halide_buffer_t *extract_buffer_ptr(Isolate *isolate, const Local<Value> &val) {
-    Local<Context> context = isolate->GetCurrentContext();
-    Local<Object> obj = val->ToObject(context).ToLocalChecked();
+halide_buffer_t *extract_buffer_ptr(const Local<Object> &obj) {
     Local<External> buf_wrapper = Local<External>::Cast(obj->GetInternalField(0));
     auto *b = (halide_buffer_t *) buf_wrapper->Value();
     internal_assert(b);
     return b;
 }
 
-// template <typename T>
-// Local<Object> host_array_wrapper(Isolate *isolate, halide_buffer_t *buf) {
-//     const size_t size_in_bytes = Buffer<>(*buf).size_in_bytes();
-//     const size_t type_size_in_bytes = (buf->type.bits + 7) / 8;
-//     Local<ArrayBuffer> array_buffer = ArrayBuffer::New(isolate, buf->host, size_in_bytes,
-//         ArrayBufferCreationMode::kExternalized);
-//     return T::New(array_buffer, 0, size_in_bytes / type_size_in_bytes);
-// }
+halide_buffer_t *extract_buffer_ptr(Isolate *isolate, const Local<Value> &val) {
+    Local<Context> context = isolate->GetCurrentContext();
+    Local<Object> obj = val->ToObject(context).ToLocalChecked();
+    return extract_buffer_ptr(obj);
+}
 
 Local<Object> wrap_existing_buffer(Isolate *isolate, halide_buffer_t *buf) {
     EscapableHandleScope scope(isolate);
@@ -222,10 +217,30 @@ Local<Object> wrap_existing_buffer(Isolate *isolate, halide_buffer_t *buf) {
     Local<Object> buffer_wrapper = buffer_template->NewInstance();
     buffer_wrapper->SetInternalField(0, External::New(isolate, (void *) buf));  // ptr to halide_buffer_t
     buffer_wrapper->SetInternalField(1, External::New(isolate, nullptr));  // owned storage for the halide_buffer_t (none)
-    buffer_wrapper->SetInternalField(2, External::New(isolate, nullptr));  // owned storage for host data
-    buffer_wrapper->SetInternalField(3, External::New(isolate, nullptr));  // owned storage for shape data
+    buffer_wrapper->SetInternalField(2, External::New(isolate, nullptr));  // owned storage for host data (none)
+    buffer_wrapper->SetInternalField(3, External::New(isolate, nullptr));  // owned storage for shape data (none)
 
     return scope.Escape(buffer_wrapper);
+}
+
+void _ensure_halide_buffer_shape_storage(Isolate *isolate, Local<Object> &buffer_wrapper, int dimensions) {
+    HandleScope scope(isolate);
+
+    halide_buffer_t *buf = extract_buffer_ptr(buffer_wrapper);
+    internal_assert(buf);
+
+    if (dimensions != buf->dimensions) {
+        if (dimensions) {
+            Local<ArrayBuffer> shape_storage = ArrayBuffer::New(isolate, sizeof(halide_dimension_t) * dimensions);
+            halide_dimension_t *shape = (halide_dimension_t *) shape_storage->GetContents().Data();
+            buf->dimensions = dimensions;
+            buf->dim = shape;
+            buffer_wrapper->SetInternalField(3, shape_storage);  // owned storage for shape data
+        } else {
+            buf->dimensions = 0;
+            buf->dim = nullptr;
+        }
+    }
 }
 
 void _halide_buffer_create_callback(const FunctionCallbackInfo<Value>& args) {
@@ -243,9 +258,9 @@ void _halide_buffer_create_callback(const FunctionCallbackInfo<Value>& args) {
 
     Local<Object> buffer_wrapper = buffer_template->NewInstance();
     buffer_wrapper->SetInternalField(0, External::New(isolate, (void *) buf));  // ptr to halide_buffer_t
-    buffer_wrapper->SetInternalField(1, buf_storage);      // owned storage for the halide_buffer_t
-    buffer_wrapper->SetInternalField(2, External::New(isolate, nullptr));  // owned storage for host data
-    buffer_wrapper->SetInternalField(3, External::New(isolate, nullptr));  // owned storage for shape data
+    buffer_wrapper->SetInternalField(1, buf_storage);                           // owned storage for the halide_buffer_t
+    buffer_wrapper->SetInternalField(2, External::New(isolate, nullptr));       // owned storage for host data (none)
+    buffer_wrapper->SetInternalField(3, External::New(isolate, nullptr));       // owned storage for shape data (none)
 
     args.GetReturnValue().Set(buffer_wrapper);
 }
@@ -274,23 +289,6 @@ void _halide_buffer_get_host_callback(const FunctionCallbackInfo<Value>& args) {
         size_in_bytes, ArrayBufferCreationMode::kExternalized);
     // Always return as uint8, regardless of our type
     args.GetReturnValue().Set(Uint8Array::New(array_buffer, 0, size_in_bytes));
-
-    // Local<Object> (*f)(Isolate *isolate, halide_buffer_t *buf) = nullptr;
-    // switch (halide_type_code(buf->type.code, buf->type.bits)) {
-    // case halide_type_code(halide_type_float, 32): f = host_array_wrapper<Float32Array>; break;
-    // case halide_type_code(halide_type_float, 64): f = host_array_wrapper<Float64Array>; break;
-    // case halide_type_code(halide_type_int, 8): f = host_array_wrapper<Int8Array>; break;
-    // case halide_type_code(halide_type_int, 16): f = host_array_wrapper<Int16Array>; break;
-    // case halide_type_code(halide_type_int, 32): f = host_array_wrapper<Int32Array>; break;
-    // case halide_type_code(halide_type_uint, 8): f = host_array_wrapper<Uint8Array>; break;
-    // case halide_type_code(halide_type_uint, 16): f = host_array_wrapper<Uint16Array>; break;
-    // case halide_type_code(halide_type_uint, 32): f = host_array_wrapper<Uint32Array>; break;
-    // default:
-    //     internal_error << "Unsupported array type.";
-    //     break;
-    // }
-
-    // args.GetReturnValue().Set((*f)(isolate, buf));
 }
 
 void _halide_buffer_get_device_callback(const FunctionCallbackInfo<Value>& args) {
@@ -333,7 +331,6 @@ void _halide_buffer_get_max_callback(const FunctionCallbackInfo<Value>& args) {
     halide_buffer_t *buf = extract_buffer_ptr(isolate, args[0]);
     const int d = args[1]->Int32Value(context).ToChecked();
     internal_assert(d >= 0 && d < buf->dimensions);
-
     args.GetReturnValue().Set(wrap_scalar(isolate, buf->dim[d].min + buf->dim[d].extent - 1));
 }
 
@@ -402,8 +399,8 @@ void _halide_buffer_get_device_dirty_callback(const FunctionCallbackInfo<Value>&
 void _halide_buffer_get_shape_callback(const FunctionCallbackInfo<Value>& args) {
     internal_assert(args.Length() == 1);
     // The only thing that downstream code does with this is pass it on
-    // to _halide_buffer_init(); just return the buffer itself to simplify management.
-    args.GetReturnValue().Set(args[0]);
+    // to _halide_buffer_init() for dst_shape, which we ignore; just return null.
+    args.GetReturnValue().SetNull();
 }
 
 void _halide_buffer_is_bounds_query_callback(const FunctionCallbackInfo<Value>& args) {
@@ -430,18 +427,16 @@ void _halide_buffer_init_callback(const FunctionCallbackInfo<Value>& args) {
     Local<Context> context = isolate->GetCurrentContext();
     HandleScope scope(isolate);
 
-    halide_buffer_t *dst = extract_buffer_ptr(isolate, args[0]);
+    Local<Object> dst_wrap = args[0]->ToObject(context).ToLocalChecked();
+    halide_buffer_t *dst = extract_buffer_ptr(dst_wrap);
     internal_assert(dst);
 
-    // The only thing we ever expect to see for the dst_shape
-    // arg here is the return value of _halide_buffer_get_shape()...
-    // which should be the same thing as args[0].
-    internal_assert(args[0] == args[1]);
-
+    // args[1] is dst_shape, which we ignore; it's necessary in native
+    // code because that memory is managed elsewhere, but in JS, the
+    // shape is managed by the buffer.
     void *host = nullptr;
     if (!args[2]->IsNull()) {
       Local<ArrayBufferView> host_array = Local<ArrayBufferView>::Cast(args[2]);
-      internal_assert(host_array->IsUint32Array());
       internal_assert(host_array->HasBuffer());
       Local<ArrayBuffer> host_array_buffer = host_array->Buffer();
       host = host_array_buffer->GetContents().Data();
@@ -466,18 +461,9 @@ void _halide_buffer_init_callback(const FunctionCallbackInfo<Value>& args) {
     const int dimensions = args[7]->Int32Value(context).ToChecked();
     internal_assert(dimensions >= 0 && dimensions < 1024);  // not a hard limit, just a sanity check
 
-    // null is ok if dimensions == 0
-    std::vector<halide_dimension_t> shape(dimensions);
-    Local<Array> shape_array = Local<Array>::Cast(args[8]);
-    internal_assert((int) shape_array->Length() == dimensions * 4);
-    for (int i = 0; i < dimensions; i++) {
-      shape[i].min = shape_array->Get(i*4 + 0)->Int32Value(context).ToChecked();
-      shape[i].extent = shape_array->Get(i*4 + 1)->Int32Value(context).ToChecked();
-      shape[i].stride = shape_array->Get(i*4 + 2)->Int32Value(context).ToChecked();
-      shape[i].flags = shape_array->Get(i*4 + 3)->Int32Value(context).ToChecked();
-    }
-
     const int flags = args[9]->Int32Value(context).ToChecked();
+
+    _ensure_halide_buffer_shape_storage(isolate, dst_wrap, dimensions);
 
     dst->host = (uint8_t *)host;
     dst->device = device;
@@ -485,16 +471,22 @@ void _halide_buffer_init_callback(const FunctionCallbackInfo<Value>& args) {
     dst->type.code = (halide_type_code_t) type_code;
     dst->type.bits = (uint8_t) type_bits;
     dst->type.lanes = 1;
-    dst->dimensions = dimensions;
-    // dst->dim = dst_shape;
-    for (int i = 0; i < dimensions; i++) {
-        dst->dim[i] = shape[i];
-    }
     dst->flags = flags;
 
-    Local<Object> buffer_wrapper = args[0]->ToObject(context).ToLocalChecked();
-    buffer_wrapper->SetInternalField(2, args[2]);  // owned storage for host data
-    buffer_wrapper->SetInternalField(3, args[1]);  // owned storage for shape data
+    dst->dimensions = dimensions;
+    {
+        Local<Array> shape_array = Local<Array>::Cast(args[8]);
+        internal_assert((int) shape_array->Length() == dimensions * 4);
+        for (int i = 0; i < dimensions; i++) {
+          dst->dim[i].min = shape_array->Get(i*4 + 0)->Int32Value(context).ToChecked();
+          dst->dim[i].extent = shape_array->Get(i*4 + 1)->Int32Value(context).ToChecked();
+          dst->dim[i].stride = shape_array->Get(i*4 + 2)->Int32Value(context).ToChecked();
+          dst->dim[i].flags = shape_array->Get(i*4 + 3)->Int32Value(context).ToChecked();
+        }
+    }
+
+    // TODO: we never share shape storage, but always share host storage. Is this right?
+    dst_wrap->SetInternalField(2, args[2]);  // owned storage for host data
 
     args.GetReturnValue().Set(args[0]);
 }
@@ -505,31 +497,30 @@ void _halide_buffer_init_from_buffer_callback(const FunctionCallbackInfo<Value>&
     Isolate *isolate = args.GetIsolate();
     HandleScope scope(isolate);
 
-    halide_buffer_t *dst = extract_buffer_ptr(isolate, args[0]);
-    internal_assert(dst);
+    Local<Context> context = isolate->GetCurrentContext();
+    Local<Object> dst_wrap = args[0]->ToObject(context).ToLocalChecked();
+    Local<Object> src_wrap = args[2]->ToObject(context).ToLocalChecked();
 
-    // The only thing we ever expect to see for the dst_shape
-    // arg here is the return value of _halide_buffer_get_shape()...
-    // which should be the same thing as args[0].
-    internal_assert(args[0] == args[1]);
+    // args[1] is dst_shape, which we ignore; it's necessary in native
+    // code because that memory is managed elsewhere, but in JS, the
+    // shape is managed by the buffer.
 
-    halide_buffer_t *src = extract_buffer_ptr(isolate, args[2]);
+    halide_buffer_t *dst = extract_buffer_ptr(dst_wrap);
+    halide_buffer_t *src = extract_buffer_ptr(src_wrap);
 
     dst->host = src->host;
     dst->device = src->device;
     dst->device_interface = src->device_interface;
     dst->type = src->type;
-    dst->dimensions = src->dimensions;
-    // dst->dim = dst_shape;
     dst->flags = src->flags;
+
+    _ensure_halide_buffer_shape_storage(isolate, dst_wrap, src->dimensions);
+    dst->dimensions = src->dimensions;
     for (int i = 0; i < dst->dimensions; i++) {
         dst->dim[i] = src->dim[i];
     }
 
-    Local<Context> context = isolate->GetCurrentContext();
-    Local<Object> dst_wrap = args[0]->ToObject(context).ToLocalChecked();
-    Local<Object> src_wrap = args[2]->ToObject(context).ToLocalChecked();
-    dst_wrap->SetInternalField(2, src_wrap->GetInternalField(2));  // owned storage for host data
+    // TODO: we never share shape storage, but always share host storage. Is this right?
     dst_wrap->SetInternalField(3, src_wrap->GetInternalField(3));  // owned storage for shape data
 
     args.GetReturnValue().Set(args[0]);
@@ -723,263 +714,6 @@ int compile_function(Isolate *isolate, Local<Context> &context,
     return 0;
 }
 
-// int make_js_copy_routine(Isolate *isolate, Local<Context> &context,
-//                          const buffer_t *buf, const Type &type, int32_t dimensions,
-//                          Local<v8::Function> &result) {
-//     std::stringstream type_name_stream;
-//     type_name_stream << type;
-//     std::string fn_name = "halide_copy_buffer_" + type_name_stream.str() + "_" + std::to_string(dimensions) + "_dimensions";
-
-//     Local<Value> preexisting = context->Global()->Get(String::NewFromUtf8(isolate, fn_name.c_str()));
-//     if (preexisting->IsFunction()) {
-//         result = Local<v8::Function>::Cast(preexisting);
-//         return 0;
-//     }
-
-//     // Chunk of Halide code to copy input to output
-//     ImageParam in(type, dimensions);
-//     Func out;
-//     out(_) = in(_);
-//     in.dim(0).set_stride(Expr());
-//     out.output_buffer().dim(0).set_stride(Expr());
-
-//     Target temp_target;
-//     temp_target.set_features({Target::JavaScript, Target::NoRuntime});
-//     Module module = out.compile_to_module({ in }, fn_name, temp_target);
-//     std::stringstream js_out_stream;
-//     Internal::CodeGen_JavaScript cg(js_out_stream);
-//     cg.compile(module);
-
-//     debug(0) << js_out_stream.str() << "\n";
-
-//     return compile_function(isolate, context, fn_name, js_out_stream.str(), result);
-// }
-
-/* This routine copies a JS object representing a buffer_t to a
- * buffer_t structure that can be passed to a C routine. It allocates
- * storage for the target buffer.
- *
- * With V8, it is impossible to get a pointer to the underlying storage
- * for an array object without forcing it to be an external array,
- * thus getting a direct pointer mutates the state of the object. The
- * arrays used can be any sort of array like object from a variety of
- * sources, and thus it is not acceptable change the object to be
- * external. In some cases, the array is already external and this
- * could be optimized, but since this is only used for testing the
- * performance hit of copying the buffers is not a huge concern.
- *
- * The copy is done using Halide generated JS code to handle any sort
- * of array that Halide can handle. (Using e.g. ArrayBuffer.slice()
- * would impose a cosntraint that the value is an ArrayBuffer based
- * thing, etc.) This is likely not important right now, but it results
- * on concise code and better exercises the JavaScript codegen, which
- * improves testing anyway.
- */
-// int32_t js_buffer_t_to_struct(Isolate *isolate, const Local<Value> &val, struct buffer_t *slot) {
-//     Local<Context> context = isolate->GetCurrentContext();
-//     Local<Object> buf = val->ToObject(context).ToLocalChecked();
-
-//     Local<Object> extents = buf->Get(String::NewFromUtf8(isolate, "extent"))->ToObject(context).ToLocalChecked();
-//     Local<Object> mins = buf->Get(String::NewFromUtf8(isolate, "min"))->ToObject(context).ToLocalChecked();
-//     Local<Object> strides = buf->Get(String::NewFromUtf8(isolate, "stride"))->ToObject(context).ToLocalChecked();
-//     for (int32_t i = 0; i < 4; i++) {
-//         slot->extent[i] = extents->Get(i)->Int32Value(context).ToChecked();
-//         slot->min[i] = mins->Get(i)->Int32Value(context).ToChecked();
-//         slot->stride[i] = strides->Get(i)->Int32Value(context).ToChecked();
-//     }
-//     slot->dev = 0;
-//     // slot->flags = buf->Get(String::NewFromUtf8(isolate, "host_dirty"))->Int32Zvalue(context).ToChecked();
-
-//     Type buf_type_guess;
-//     Local<Value> host_array = buf->Get(String::NewFromUtf8(isolate, "host"));
-//     if (host_array->IsInt8Array()) {
-//         buf_type_guess = Int(8);
-//     } else if (host_array->IsUint8Array()) {
-//         buf_type_guess = UInt(8);
-//     } else if (host_array->IsInt16Array()) {
-//         buf_type_guess = Int(16);
-//     } else if (host_array->IsUint16Array()) {
-//         buf_type_guess = UInt(16);
-//     } else if (host_array->IsInt32Array()) {
-//         buf_type_guess = Int(32);
-//     } else if (host_array->IsUint32Array()) {
-//         buf_type_guess = UInt(32);
-//     } else if (host_array->IsFloat32Array()) {
-//         buf_type_guess = Float(32);
-//     } else if (host_array->IsFloat64Array()) {
-//         buf_type_guess = Float(64);
-//     } else {
-//         if (slot->elem_size == 8) {
-//             buf_type_guess = Float(64);
-//         } else {
-//             buf_type_guess = UInt(slot->elem_size * 8);
-//         }
-//     }
-
-//     int32_t dimensions = 0;
-//     while (dimensions < 4 && slot->extent[dimensions] != 0) {
-//         dimensions++;
-//     }
-
-//     int32_t result = 0;
-//     if (!host_array->IsNull() && dimensions != 0) {
-//         Local<v8::Function> copy_function;
-//         if (make_js_copy_routine(isolate, context, slot, buf_type_guess, dimensions, copy_function) != 0) {
-//             return -1;
-//         }
-
-//         // int32_t total_size = buffer_total_size(slot);
-//         // slot->host = (uint8_t *)malloc(total_size * slot->elem_size);
-
-//         // Local<Object> temp_buf = make_buffer_t(isolate, slot, halide_type_to_external_array_type(buf_type_guess));
-
-//         // v8::Handle<Value> js_args[2];
-//         // js_args[0] = val;
-//         // js_args[1] = temp_buf;
-
-//         // result = copy_function->Call(copy_function, 2, &js_args[0])->Int32Value(context).ToChecked();
-// result=-1;
-//         if (result != 0) {
-//             free(slot->host);
-//             slot->host = NULL;
-//         }
-//     } else {
-//         slot->host = nullptr;
-//     }
-
-//     return result;
-// }
-
-/* This routine copies a buffer_t struct to the storage pointed to by
- * a JS object representing a buffer_t. It frees the storage for the
- * source buffer. */
-// int buffer_t_struct_to_js(Isolate *isolate, buffer_t *slot, Local<Value> val) {
-    // Local<Context> context = isolate->GetCurrentContext();
-    // Local<Object> buf = val->ToObject(context).ToLocalChecked();
-
-    // int32_t dimensions = 0;
-    // while (dimensions < 4 && slot->extent[dimensions] != 0) {
-    //     dimensions++;
-    // }
-
-    // Local<Object> extents = buf->Get(String::NewFromUtf8(isolate, "extent"))->ToObject(context).ToLocalChecked();
-    // Local<Object> mins = buf->Get(String::NewFromUtf8(isolate, "min"))->ToObject(context).ToLocalChecked();
-    // Local<Object> strides = buf->Get(String::NewFromUtf8(isolate, "stride"))->ToObject(context).ToLocalChecked();
-    // for (int32_t i = 0; i < 4; i++) {
-    //     if (i < dimensions) {
-    //         Local<Value> extent = Integer::New(isolate, slot->extent[i]);
-    //         extents->Set(i, extent);
-    //     }
-    //     if (i < dimensions) {
-    //         Local<Value> min = Integer::New(isolate, slot->min[i]);
-    //         mins->Set(i, min);
-    //     }
-    //     if (i < dimensions) {
-    //         Local<Value> stride = Integer::New(isolate, slot->stride[i]);
-    //         strides->Set(i, stride);
-    //     }
-    // }
-    // Local<Value> elem_size = Integer::New(isolate, slot->elem_size);
-    // buf->Set(String::NewFromUtf8(isolate, "elem_size"), elem_size);
-    // buf->Set(String::NewFromUtf8(isolate, "host_dirty"), Boolean::New(isolate, slot->host_dirty));
-    // buf->Set(String::NewFromUtf8(isolate, "dev_dirty"), Boolean::New(isolate, slot->dev_dirty));
-
-    // Type buf_type_guess;
-    // Local<Value> host_array = buf->Get(String::NewFromUtf8(isolate, "host"));
-    // if (host_array->IsInt8Array()) {
-    //     buf_type_guess = Int(8);
-    // } else if (host_array->IsUint8Array()) {
-    //     buf_type_guess = UInt(8);
-    // } else if (host_array->IsInt16Array()) {
-    //     buf_type_guess = Int(16);
-    // } else if (host_array->IsUint16Array()) {
-    //     buf_type_guess = UInt(16);
-    // } else if (host_array->IsInt32Array()) {
-    //     buf_type_guess = Int(32);
-    // } else if (host_array->IsUint32Array()) {
-    //     buf_type_guess = UInt(32);
-    // } else if (host_array->IsFloat32Array()) {
-    //     buf_type_guess = Float(32);
-    // } else if (host_array->IsFloat64Array()) {
-    //     buf_type_guess = Float(64);
-    // } else {
-    //     if (slot->elem_size == 8) {
-    //         buf_type_guess = Float(64);
-    //     } else {
-    //         buf_type_guess = UInt(slot->elem_size * 8);
-    //     }
-    // }
-
-    // int32_t result = 0;
-    // if (!host_array->IsNull() && dimensions != 0) {
-    //     Local<v8::Function> copy_function;
-    //     if (make_js_copy_routine(isolate, context, slot, buf_type_guess, dimensions, copy_function) != 0) {
-    //         return -1;
-    //     }
-
-    //     Local<Object> temp_buf = make_buffer_t(isolate, slot, halide_type_to_external_array_type(buf_type_guess));
-
-    //     v8::Handle<Value> js_args[2];
-    //     js_args[0] = temp_buf;
-    //     js_args[1] = val;
-
-    //     // TODO: Is this the correct reciever?
-    //     result = copy_function->Call(copy_function, 2, &js_args[0])->Int32Value(context).ToChecked();
-
-    //     free(slot->host);
-    //     slot->host = NULL;
-    // } else {
-    //     internal_assert(slot->host == nullptr) << "";
-    // }
-
-    // return result;
-//   return -1;
-// }
-
-// template <typename T, typename S>
-// void slot_to_return_val(const uint64_t *slot, ReturnValue<Value> val) {
-//     T slot_value = *(const T *)slot;
-//     val.Set((S)slot_value);
-// }
-
-// void uint64_slot_to_return_value(const Halide::Type &type, const uint64_t *slot, ReturnValue<Value> val) {
-//     if (type.is_handle()) {
-//     } else if (type.is_float()) {
-//         if (type.bits() == 32) {
-//             slot_to_return_val<float, double>(slot, val);
-//         } else {
-//             internal_assert(type.bits() == 64) << "Floating-point type that isn't 32 or 64-bits wide.\n";
-//             slot_to_return_val<double, double>(slot, val);
-//         }
-//     } else if (type.is_uint()) {
-//         if (type.bits() == 1) {
-//           slot_to_return_val<bool, bool>(slot, val);
-//         } else if (type.bits() == 8) {
-//           slot_to_return_val<uint8_t, uint32_t>(slot, val);
-//         } else if (type.bits() == 16) {
-//           slot_to_return_val<uint16_t, uint32_t>(slot, val);
-//         } else if (type.bits() == 32) {
-//           slot_to_return_val<uint32_t, uint32_t>(slot, val);
-//         } else if (type.bits() == 64) {
-//             user_error << "Unsigned 64-bit integer types are not supported with JavaScript.\n";
-//             slot_to_return_val<uint64_t, double>(slot, val);
-//         }
-//     } else {
-//         if (type.bits() == 1) {
-//           slot_to_return_val<bool, bool>(slot, val);
-//         } else if (type.bits() == 8) {
-//           slot_to_return_val<int8_t, int32_t>(slot, val);
-//         } else if (type.bits() == 16) {
-//           slot_to_return_val<int16_t, int32_t>(slot, val);
-//         } else if (type.bits() == 32) {
-//           slot_to_return_val<int32_t, int32_t>(slot, val);
-//         } else if (type.bits() == 64) {
-//             user_error << "64-bit integer types are not supported with JavaScript.\n";
-//             slot_to_return_val<int64_t, double>(slot, val);
-//         }
-//     }
-// }
-
 void js_value_to_uint64_slot(const Local<Context> &context, const Halide::Type &type, const Local<Value> &val, uint64_t *slot) {
     dynamic_type_dispatch<ExtractAndStoreScalar>(type, context, val, (void *) slot);
 }
@@ -1001,56 +735,34 @@ void v8_extern_wrapper(const v8::FunctionCallbackInfo<v8::Value>& args) {
     auto iter = jit_externs->find(*str_val);
     internal_assert(iter != jit_externs->end()) << "jit_extern " << *str_val << " not found in map.";
 
-    // Each scalar arg is stored in a 64-bit slot
-    size_t scalar_args_count = 0;
-    // Each buffer gets a slot in an array of buffer structs
-    size_t buffer_args_count = 0;
-
-    for (const Type &arg_type : iter->second.extern_c_function().signature().arg_types()) {
-        if (arg_type == type_of<halide_buffer_t *>()) {
-            buffer_args_count++;
-        } else {
-            scalar_args_count++;
-        }
-    }
-
-    std::vector<halide_buffer_t> buffer_args(buffer_args_count);
-    std::vector<uint64_t> scalar_args(scalar_args_count);
+    const auto &arg_types = iter->second.extern_c_function().signature().arg_types();
+    // Note that this allocates wasted space for buffer args too, but that's ok.
+    std::vector<uint64_t> scalar_args_storage(arg_types.size());
 
     size_t args_index = 0;
-    size_t buffer_arg_index = 0;
-    size_t scalar_arg_index = 0;
-    std::vector<void *> trampoline_args;
-    for (const Type &arg_type : iter->second.extern_c_function().signature().arg_types()) {
+    std::vector<void *> trampoline_args(arg_types.size());
+    for (const Type &arg_type : arg_types) {
+        const auto &arg = args[args_index];
         if (arg_type == type_of<halide_buffer_t *>()) {
-            // js_buffer_t_to_struct(isolate, args[args_index++], &buffer_args[buffer_arg_index]);
-            // trampoline_args.push_back(&buffer_args[buffer_arg_index++]);
-internal_error << "OOPS";
+            halide_buffer_t *buf = extract_buffer_ptr(isolate, arg);
+            internal_assert(buf);
+            trampoline_args[args_index] = (void *) buf;
         } else {
-            js_value_to_uint64_slot(context, arg_type, args[args_index++], &scalar_args[scalar_arg_index]);
-            trampoline_args.push_back(&scalar_args[scalar_arg_index++]);
+            auto *slot = &scalar_args_storage[args_index];
+            js_value_to_uint64_slot(context, arg_type, arg, slot);
+            trampoline_args[args_index] = (void *) slot;
         }
+        args_index++;
     }
 
-    uint64_t ret_val;
-    if (!iter->second.extern_c_function().signature().is_void_return()) {
+    uint64_t ret_val = 0;
+    const bool has_retval = !iter->second.extern_c_function().signature().is_void_return();
+    if (has_retval) {
         trampoline_args.push_back(&ret_val);
     }
-    (*trampoline)(&trampoline_args[0]);
+    (*trampoline)(trampoline_args.data());
 
-    args_index = 0;
-    buffer_arg_index = 0;
-    scalar_arg_index = 0;
-    for (const Type &arg_type : iter->second.extern_c_function().signature().arg_types()) {
-        if (arg_type == type_of<halide_buffer_t *>()) {
-            // buffer_t_struct_to_js(isolate, &buffer_args[buffer_arg_index++], args[args_index++]);
-        } else {
-            args_index++;
-        }
-        // No need to retrieve scalar args as they are passed by value.
-    }
-
-    if (!iter->second.extern_c_function().signature().is_void_return()) {
+    if (has_retval) {
         dynamic_type_dispatch<LoadAndReturnScalar>(iter->second.extern_c_function().signature().ret_type(), (void *) &ret_val, args.GetReturnValue());
     }
 }
@@ -1217,6 +929,16 @@ int run_javascript_v8(std::vector<std::pair<Argument, const void *>> args,
 #endif
 
 #if WITH_JAVASCRIPT_SPIDERMONKEY
+
+/*
+    This code is kept in place (though disabled by default) because it
+    is severely out of date and is unlikely to even compile, much less
+    work correctly; it needs rewriting from (mostly) scratch
+    to match the V8-based glue. It is kept in place to emphasize that the support
+    in this file is not intended to be V8-only; this code should be updated
+    if this branch is ever to land.
+*/
+#error "JS-SpiderMonkey support not compile, please see comments"
 
 // SpiderMonkey headers do not compile with -Werror and -Wall
 #pragma clang diagnostic push
