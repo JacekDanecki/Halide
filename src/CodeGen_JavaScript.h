@@ -9,7 +9,8 @@
 #include <string>
 #include <vector>
 #include <ostream>
-#include <map>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "IRPrinter.h"
 #include "Module.h"
@@ -49,8 +50,11 @@ protected:
     /** An ID for the most recently generated ssa variable */
     std::string id;
 
-    /** A cache of generated values in scope */
-    std::map<std::string, std::string> cache;
+    /** A cache of generated values in scope, mapping rhs -> id */
+    std::unordered_map<std::string, std::string> rhs_to_id_cache;
+    std::unordered_set<std::string> valid_ids_cache;
+
+    void clear_cache();
 
     /** Is SIMD.js allowed in the current scope being compiled?
      * Generally set on a per module basis. */
@@ -78,7 +82,7 @@ protected:
 
     std::string buffer_host_as_typed_array(const Type &t, const std::string &buffer_name);
 
-    std::string make_js_int_cast(std::string value, bool src_unsigned, int src_bits, bool dst_unsigned, int dst_bits);
+    std::string make_js_int_cast(const std::string &value, const Type &src, const Type &dst);
 
     /** Open a new C scope (i.e. throw in a brace, increase the indent) */
     void open_scope();
@@ -139,7 +143,7 @@ protected:
     void visit(const Sub *) override;
     void visit(const UIntImm *) override;
     void visit(const Variable *) override;
-    void visit_binop(Type t, Expr a, Expr b, const char *op, const char *simd_js_op);
+    void visit_binop(const Type &t, Expr a, Expr b, const char *op, const char *simd_js_op);
 
     std::string fround_start_if_needed(const Type &t) const;
     std::string fround_end_if_needed(const Type &t) const;

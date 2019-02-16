@@ -490,37 +490,40 @@ CodeGen_JavaScript::CodeGen_JavaScript(ostream &s) : IRPrinter(s), id("$$ BAD ID
 CodeGen_JavaScript::~CodeGen_JavaScript() {
 }
 
-string CodeGen_JavaScript::make_js_int_cast(string value, bool src_unsigned, int src_bits, bool dst_unsigned, int dst_bits) {
-    // TODO: Do we us print_assignment to cache constants?
-    string result;
-    if ((src_bits <= dst_bits) && (src_unsigned == dst_unsigned)) {
-        result = value;
-    } else {
-        string mask;
-        switch (dst_bits) {
-        case 1:
-            mask = "1";
-            break;
-        case 8:
-            mask = "0xff";
-            break;
-        case 16:
-            mask = "0xffff";
-            break;
-        case 32:
-            mask = "0xffffffff";
-            break;
-        default:
-            internal_error << "Unknown bit width (" << dst_bits << ") making JavaScript cast.\n";
-            break;
-        }
-
-        result = print_assignment(Int(32), value + " & " + mask);
-        string shift_op = dst_unsigned ? ">>>" : ">>";
-        string shift_amount = std::to_string(32 - dst_bits);
-        result = print_assignment(Int(32), "(" + result + " << " + shift_amount + ") " + shift_op + " " + shift_amount);
+string CodeGen_JavaScript::make_js_int_cast(const string &value, const Type &src, const Type &dst) {
+    // TODO: Do we use print_assignment to cache constants?
+    if (src.bits() <= dst.bits() && src.is_uint() == dst.is_uint()) {
+        return value;
     }
-    return result;
+
+    const char *mask = nullptr;
+    switch (dst.bits()) {
+    case 1:
+        mask = "1";
+        break;
+    case 8:
+        mask = "0xff";
+        break;
+    case 16:
+        mask = "0xffff";
+        break;
+    case 32:
+        mask = "0xffffffff";
+        break;
+    default:
+        internal_error << "Unknown bit width (" << dst.bits() << ") making JavaScript cast.\n";
+        break;
+    }
+
+    string masked = print_assignment(Int(32), value + " & " + mask);
+    if (dst.is_uint()) {
+        return print_assignment(dst, masked);
+    }
+
+    // If dst is signed, we need to propagate the sign bit
+    string shift_op = dst.is_uint() ? ">>>" : ">>";
+    string shift_amount = std::to_string(32 - dst.bits());
+    return print_assignment(dst, "(" + masked + " << " + shift_amount + ") " + shift_op + " " + shift_amount);
 }
 
 string javascript_type_array_name_fragment(const Type &type) {
@@ -589,8 +592,7 @@ string CodeGen_JavaScript::print_reinterpret(Type type, Expr e) {
 
         for (int lane = 0; lane < type.lanes(); lane++) {
             if ((type.is_int() || type.is_uint()) && (e.type().is_int() || e.type().is_uint())) {
-                rhs << lead << make_js_int_cast(print_expr(conditionally_extract_lane(e, lane)),
-                                                e.type().is_uint(), e.type().bits(), type.is_uint(), type.bits());
+                rhs << lead << make_js_int_cast(print_expr(conditionally_extract_lane(e, lane)), e.type(), type);
                 lead = ", ";
             } else {
                 int32_t bytes_needed = (std::max(type.bits(), e.type().bits()) + 7) / 8;
@@ -766,6 +768,11 @@ string CodeGen_JavaScript::buffer_host_as_typed_array(const Type &t, const strin
   return print_assignment(Type(), array.str());
 }
 
+void CodeGen_JavaScript::clear_cache() {
+    rhs_to_id_cache.clear();
+    valid_ids_cache.clear();
+}
+
 string CodeGen_JavaScript::print_assignment(Type /* t */, const std::string &rhs) {
     internal_assert(!rhs.empty());
 
@@ -775,15 +782,21 @@ string CodeGen_JavaScript::print_assignment(Type /* t */, const std::string &rhs
         return rhs;
     }
 
+    if (valid_ids_cache.count(rhs)) {
+        // No need to do a redundant assignment.
+        return rhs;
+    }
+
     // TODO: t is ignored and I expect casts will be required for value correctness.
     // TODO: this could be a lot smarter about caching, but JS has different scoping rules
-    map<string, string>::const_iterator cached = cache.find(rhs);
+    auto cached = rhs_to_id_cache.find(rhs);
 
-    if (cached == cache.end()) {
+    if (cached == rhs_to_id_cache.end()) {
         id = unique_name('_');
         do_indent();
         stream << "var " << id << " = " << rhs << ";\n";
-        cache[rhs] = id;
+        rhs_to_id_cache[rhs] = id;
+        valid_ids_cache.insert(id);
     } else {
         id = cached->second;
     }
@@ -791,14 +804,14 @@ string CodeGen_JavaScript::print_assignment(Type /* t */, const std::string &rhs
 }
 
 void CodeGen_JavaScript::open_scope() {
-    cache.clear();
+    clear_cache();
     do_indent();
     indent++;
     stream << "{\n";
 }
 
 void CodeGen_JavaScript::close_scope(const std::string &comment) {
-    cache.clear();
+    clear_cache();
     indent--;
     do_indent();
     if (!comment.empty()) {
@@ -909,11 +922,9 @@ void CodeGen_JavaScript::visit(const Cast *op) {
         } else if (dst.is_handle() || src.is_handle()) {
             internal_error << "Can't cast from " << src << " to " << dst << "\n";
         } else if (!src.is_float() && !dst.is_float()) {
-            value = make_js_int_cast(value, src.is_uint(), src.bits(), dst.is_uint(), dst.bits());
-        } else if (src.is_float() && dst.is_int()) {
-            value = make_js_int_cast("Math.trunc(" + value + ")", false, 64, false, dst.bits());
-        } else if (src.is_float() && dst.is_uint()) {
-            value = make_js_int_cast("Math.trunc(" + value + ")", false, 64, true, dst.bits());
+            value = make_js_int_cast(value, src, dst);
+        } else if (src.is_float() && (dst.is_int() || dst.is_uint())) {
+            value = make_js_int_cast("Math.trunc(" + value + ")", Float(64), dst);
         } else {
             internal_assert(dst.is_float());
             value = fround_start_if_needed(op->type) + value + fround_end_if_needed(op->type);
@@ -925,7 +936,7 @@ void CodeGen_JavaScript::visit(const Cast *op) {
     print_assignment(op->type, rhs.str());
 }
 
-void CodeGen_JavaScript::visit_binop(Type t, Expr a, Expr b,
+void CodeGen_JavaScript::visit_binop(const Type &t, Expr a, Expr b,
                                      const char *op, const char *simd_js_op) {
     ostringstream rhs;
     std::string simd_js_type;
@@ -948,11 +959,14 @@ void CodeGen_JavaScript::visit_binop(Type t, Expr a, Expr b,
             rhs << "]";
         }
     }
-    string id_var = print_assignment(t, rhs.str());
+    print_assignment(t, rhs.str());
 }
 
 void CodeGen_JavaScript::visit(const Add *op) {
     visit_binop(op->type, op->a, op->b, "+", "add");
+    if (!op->type.is_float()) {
+        make_js_int_cast(id, Float(64), op->type);
+    }
 }
 
 void CodeGen_JavaScript::visit(const Sub *op) {
@@ -962,6 +976,9 @@ void CodeGen_JavaScript::visit(const Sub *op) {
         print_assignment(op->type, simd_js_type + ".neg(" + arg + ")");
     } else {
         visit_binop(op->type, op->a, op->b, "-", "sub");
+        if (!op->type.is_float()) {
+            make_js_int_cast(id, Float(64), op->type);
+        }
     }
 }
 
@@ -972,11 +989,10 @@ void CodeGen_JavaScript::visit(const Mul *op) {
     } else {
         ostringstream rhs;
         const char *lead_char = (op->type.lanes() != 1) ? "[" : "";
-
         for (int lane = 0; lane < op->type.lanes(); lane++) {
             string a = print_expr(conditionally_extract_lane(op->a, lane));
             string b = print_expr(conditionally_extract_lane(op->b, lane));
-            rhs << lead_char << "Math.imul(" << a << ", " << b << ")";
+            rhs << lead_char << make_js_int_cast("Math.imul(" + a + ", " + b + ")", Int(32), op->type.element_of());
             lead_char = ", ";
         }
         if (op->type.lanes() > 1) {
@@ -999,17 +1015,16 @@ void CodeGen_JavaScript::visit(const Div *op) {
         rhs << literal_may_be_vector_start(op->type);
         for (int lane = 0; lane < op->type.lanes(); lane++) {
             int bits;
-
             if (is_const_power_of_two_integer(conditionally_extract_lane(op->b, lane), &bits)) {
                 // JavaScript distinguishes signed vs. unsigned shift using >> vs >>>
-                string shift_op = op->type.is_uint() ? ">>>" : ">>";
+                string shift_op = op->type.is_uint() ? " >>> " : " >> ";
                 rhs << lead_char << print_expr(conditionally_extract_lane(op->a, lane)) << shift_op << bits;
             } else {
                 string a = print_expr(conditionally_extract_lane(op->a, lane));
                 string b = print_expr(conditionally_extract_lane(op->b, lane));
                 rhs << lead_char << fround_start_if_needed(op->type);
                 if (!op->type.is_float()) {
-                    rhs << "Math.floor(" << a << " / " << b << ")";
+                    rhs << make_js_int_cast("Math.floor(" + a + " / " + b + ")", Float(64), op->type);
                 } else {
                     rhs << a << " / " << b;
                 }
@@ -1030,7 +1045,6 @@ void CodeGen_JavaScript::visit(const Mod *op) {
     const char *lead_char = "";
     for (int lane = 0; lane < op->type.lanes(); lane++) {
         int bits;
-
         if (is_const_power_of_two_integer(conditionally_extract_lane(op->b, lane), &bits)) {
           rhs << lead_char << fround_start_if_needed(op->type)
               << print_expr(conditionally_extract_lane(op->a, lane)) << " & " << ((1 << bits) - 1)
@@ -1786,7 +1800,7 @@ stream<<"//type_cast_needed:"<<type_cast_needed<<"\n";
             lane_by_lane_store(op, typed_name, type_cast_needed);
         }
     }
-    cache.clear();
+    clear_cache();
 }
 
 void CodeGen_JavaScript::visit(const Let *op) {

@@ -829,27 +829,24 @@ void add_extern_callbacks(Isolate *isolate,
 int compile_javascript_v8(const std::string &source, const std::string &fn_name,
                           const JITExternMap &externs,
                           JITModule trampolines,
-                          JS_V8::Isolate *&isolate, JS_V8::Persistent<JS_V8::Context> &context_holder,
+                          JS_V8::Isolate *&isolate,
+                          JS_V8::Persistent<JS_V8::Context> &context_holder,
                           JS_V8::Persistent<JS_V8::Function> &function_holder) {
     using namespace JS_V8;
 
     debug(1) << "Compiling JavaScript function " << fn_name << "\n";
     // TODO: thread safety.
     static std::unique_ptr<ArrayBuffer::Allocator> array_buffer_allocator(new HalideArrayBufferAllocator());
-    static bool inited = false;
-    if (!inited) {
+    // Use this approach to ensure V8 is inited only once, if multiple threads are in use
+    static bool inited = []() -> bool {
         // Initialize V8.
         V8::InitializeICU();
         Platform* platform = platform::CreateDefaultPlatform();
         V8::InitializePlatform(platform);
-        const char *flags[] = {
-          "HalideJavaScriptExecutor"
-        };
-        int flags_size = sizeof(flags)/sizeof(flags[0]);
-        V8::SetFlagsFromCommandLine(&flags_size, const_cast<char **>(flags), false);
         V8::Initialize();
-        inited = true;
-    }
+        return true;
+    }();
+    internal_assert(inited);
 
     Isolate::CreateParams isolate_params;
     isolate_params.array_buffer_allocator = array_buffer_allocator.get();
@@ -878,7 +875,6 @@ int compile_javascript_v8(const std::string &source, const std::string &fn_name,
         return -1;
     }
     function_holder.Reset(isolate, function);
-
     return 0;
 }
 
@@ -1965,7 +1961,7 @@ JavaScriptModuleContents() {
 
     ~JavaScriptModuleContents() {
 #ifdef WITH_JAVASCRIPT_V8
-        if (v8_isolate != NULL) {
+        if (v8_isolate != nullptr) {
             // Not sure if this is required...
             {
                 v8::Isolate::Scope isolate_scope(v8_isolate);

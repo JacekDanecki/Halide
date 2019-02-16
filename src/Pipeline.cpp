@@ -535,7 +535,7 @@ void Pipeline::compile_jit(const Target &target_arg) {
         CodeGen_JavaScript cg(out);
         cg.compile(module);
 // TODO(srj):
-        if (debug::debug_level() >= 0) {
+        if (debug::debug_level() >= 1) {
             debug(0) << "Dumping to /tmp/" << name << ".jit.js\n";
             std::ofstream js_debug(("/tmp/" + name + ".jit.js").c_str());
             js_debug << out.str();
