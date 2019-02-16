@@ -195,6 +195,15 @@ class HalideArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
   virtual void Free(void* data, size_t) { free(data); }
 };
 
+JITUserContext *get_jit_user_context(Isolate *isolate, const Local<Value> &arg) {
+    Local<Context> context = isolate->GetCurrentContext();
+    Local<Object> user_context = arg->ToObject(context).ToLocalChecked();
+    Local<External> handle_wrapper = Local<External>::Cast(user_context->GetInternalField(0));
+    JITUserContext *jit_user_context = (JITUserContext *)handle_wrapper->Value();
+    internal_assert(jit_user_context);
+    return jit_user_context;
+}
+
 halide_buffer_t *extract_buffer_ptr(const Local<Object> &obj) {
     Local<External> buf_wrapper = Local<External>::Cast(obj->GetInternalField(0));
     auto *b = (halide_buffer_t *) buf_wrapper->Value();
@@ -434,6 +443,7 @@ void _halide_buffer_init_callback(const FunctionCallbackInfo<Value>& args) {
     // args[1] is dst_shape, which we ignore; it's necessary in native
     // code because that memory is managed elsewhere, but in JS, the
     // shape is managed by the buffer.
+
     void *host = nullptr;
     if (!args[2]->IsNull()) {
       Local<ArrayBufferView> host_array = Local<ArrayBufferView>::Cast(args[2]);
@@ -499,11 +509,10 @@ void _halide_buffer_init_from_buffer_callback(const FunctionCallbackInfo<Value>&
 
     Local<Context> context = isolate->GetCurrentContext();
     Local<Object> dst_wrap = args[0]->ToObject(context).ToLocalChecked();
-    Local<Object> src_wrap = args[2]->ToObject(context).ToLocalChecked();
-
     // args[1] is dst_shape, which we ignore; it's necessary in native
     // code because that memory is managed elsewhere, but in JS, the
     // shape is managed by the buffer.
+    Local<Object> src_wrap = args[2]->ToObject(context).ToLocalChecked();
 
     halide_buffer_t *dst = extract_buffer_ptr(dst_wrap);
     halide_buffer_t *src = extract_buffer_ptr(src_wrap);
@@ -521,9 +530,122 @@ void _halide_buffer_init_from_buffer_callback(const FunctionCallbackInfo<Value>&
     }
 
     // TODO: we never share shape storage, but always share host storage. Is this right?
-    dst_wrap->SetInternalField(3, src_wrap->GetInternalField(3));  // owned storage for shape data
+    dst_wrap->SetInternalField(2, src_wrap->GetInternalField(2));  // owned storage for host data
 
     args.GetReturnValue().Set(args[0]);
+}
+
+void _halide_buffer_crop_callback(const FunctionCallbackInfo<Value>& args) {
+    internal_assert(args.Length() == 6);
+
+    Isolate *isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+
+    Local<Context> context = isolate->GetCurrentContext();
+
+    JITUserContext *jit_user_context = get_jit_user_context(isolate, args[0]);
+    Local<Object> dst_wrap = args[1]->ToObject(context).ToLocalChecked();
+    // args[2] is dst_shape, which we ignore; it's necessary in native
+    // code because that memory is managed elsewhere, but in JS, the
+    // shape is managed by the buffer.
+    Local<Object> src_wrap = args[3]->ToObject(context).ToLocalChecked();
+    Local<Array> min_array = Local<Array>::Cast(args[4]);
+    Local<Array> extent_array = Local<Array>::Cast(args[5]);
+
+    halide_buffer_t *dst = extract_buffer_ptr(dst_wrap);
+    halide_buffer_t *src = extract_buffer_ptr(src_wrap);
+
+    dst->device = 0;
+    dst->device_interface = 0;
+    dst->host = src->host;
+    dst->flags = src->flags;
+    dst->type = src->type;
+    _ensure_halide_buffer_shape_storage(isolate, dst_wrap, src->dimensions);
+
+    internal_assert((int) min_array->Length() >= dst->dimensions);
+    internal_assert((int) extent_array->Length() >= dst->dimensions);
+
+    int64_t offset = 0;
+    for (int i = 0; i < dst->dimensions; i++) {
+        const int min = min_array->Get(i)->Int32Value(context).ToChecked();
+        const int extent = extent_array->Get(i)->Int32Value(context).ToChecked();
+        dst->dim[i] = src->dim[i];
+        dst->dim[i].min = min;
+        dst->dim[i].extent = extent;
+        offset += (min - src->dim[i].min) * src->dim[i].stride;
+    }
+    if (dst->host) {
+        dst->host += offset * src->type.bytes();
+    }
+
+    internal_assert(!src->device_interface);
+    if (src->device_interface) {
+        src->device_interface->device_crop(jit_user_context, src, dst);
+    }
+
+    // TODO: we never share shape storage, but always share host storage. Is this right?
+    dst_wrap->SetInternalField(2, src_wrap->GetInternalField(2));  // owned storage for host data
+
+    args.GetReturnValue().Set(dst_wrap);
+}
+
+void _halide_buffer_retire_crop_impl(JITUserContext *jit_user_context, halide_buffer_t *crop, halide_buffer_t *parent) {
+    if (crop->device) {
+        if (!parent->device) {
+            // We have been given a device allocation by the extern
+            // stage. It only represents the cropped region, so we
+            // can't just give it to the parent.
+            if (crop->device_dirty()) {
+                crop->device_interface->copy_to_host(jit_user_context, crop);
+            }
+            crop->device_interface->device_free(jit_user_context, crop);
+        } else {
+            // We are a crop of an existing device allocation.
+            if (crop->device_dirty()) {
+                parent->set_device_dirty();
+            }
+            crop->device_interface->device_release_crop(jit_user_context, crop);
+        }
+    }
+    if (crop->host_dirty()) {
+        parent->set_host_dirty();
+    }
+}
+
+void _halide_buffer_retire_crop_after_extern_stage_callback(const FunctionCallbackInfo<Value>& args) {
+    internal_assert(args.Length() == 2);
+
+    Isolate *isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
+    JITUserContext *jit_user_context = get_jit_user_context(isolate, args[0]);
+    Local<Array> buffer_array = Local<Array>::Cast(args[2]);
+    internal_assert(buffer_array->Length() == 2);
+    halide_buffer_t *crop = extract_buffer_ptr(buffer_array->Get(0)->ToObject(context).ToLocalChecked());
+    halide_buffer_t *parent = extract_buffer_ptr(buffer_array->Get(1)->ToObject(context).ToLocalChecked());
+    _halide_buffer_retire_crop_impl(jit_user_context, crop, parent);
+    args.GetReturnValue().Set(0);
+}
+
+void _halide_buffer_retire_crops_after_extern_stage_callback(const FunctionCallbackInfo<Value>& args) {
+    internal_assert(args.Length() == 2);
+
+    Isolate *isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
+    JITUserContext *jit_user_context = get_jit_user_context(isolate, args[0]);
+    Local<Array> buffer_array = Local<Array>::Cast(args[2]);
+    size_t index = 0;
+    while (index < buffer_array->Length()) {
+        Local<Object> crop = buffer_array->Get(index++)->ToObject(context).ToLocalChecked();
+        if (crop->IsNull()) break;
+
+        Local<Object> parent = buffer_array->Get(index++)->ToObject(context).ToLocalChecked();
+        if (parent->IsNull()) break;
+
+        _halide_buffer_retire_crop_impl(jit_user_context, extract_buffer_ptr(crop), extract_buffer_ptr(parent));
+    }
+    args.GetReturnValue().Set(0);
 }
 
 void _halide_buffer_set_bounds_callback(const FunctionCallbackInfo<Value>& args) {
@@ -539,15 +661,6 @@ void _halide_buffer_set_bounds_callback(const FunctionCallbackInfo<Value>& args)
     buf->dim[d].min = min;
     buf->dim[d].extent = extent;
     args.GetReturnValue().Set(args[0]);
-}
-
-JITUserContext *get_jit_user_context(Isolate *isolate, const Local<Value> &arg) {
-    Local<Context> context = isolate->GetCurrentContext();
-    Local<Object> user_context = arg->ToObject(context).ToLocalChecked();
-    Local<External> handle_wrapper = Local<External>::Cast(user_context->GetInternalField(0));
-    JITUserContext *jit_user_context = (JITUserContext *)handle_wrapper->Value();
-    internal_assert(jit_user_context);
-    return jit_user_context;
 }
 
 void halide_print_callback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -797,6 +910,9 @@ Local<ObjectTemplate> make_global_template(Isolate *isolate) {
     ADD_CALLBACK_FUNCTION(_halide_buffer_get_type);
     ADD_CALLBACK_FUNCTION(_halide_buffer_init);
     ADD_CALLBACK_FUNCTION(_halide_buffer_init_from_buffer);
+    ADD_CALLBACK_FUNCTION(_halide_buffer_crop);
+    ADD_CALLBACK_FUNCTION(_halide_buffer_retire_crop_after_extern_stage);
+    ADD_CALLBACK_FUNCTION(_halide_buffer_retire_crops_after_extern_stage);
     ADD_CALLBACK_FUNCTION(_halide_buffer_set_bounds);
 
     #undef ADD_CALLBACK_FUNCTION

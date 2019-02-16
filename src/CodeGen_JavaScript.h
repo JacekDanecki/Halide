@@ -143,7 +143,7 @@ protected:
     void visit(const Sub *) override;
     void visit(const UIntImm *) override;
     void visit(const Variable *) override;
-    void visit_binop(const Type &t, Expr a, Expr b, const char *op, const char *simd_js_op);
+    void visit_binop(const Type &t, Expr a, Expr b, const char *op, const char *simd_js_op, const Type &op_result_type = Type());
 
     std::string fround_start_if_needed(const Type &t) const;
     std::string fround_end_if_needed(const Type &t) const;

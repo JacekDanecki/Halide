@@ -26,6 +26,9 @@ namespace {
 
 // TODO: Fill in preamble...
 const char * const preamble = R"INLINE_CODE(
+// TODO: make this workable
+// "use strict";
+
 var halide_error_code_success = 0;
 var halide_error_code_generic_error = -1;
 var halide_error_code_explicit_bounds_too_small = -2;
@@ -296,7 +299,10 @@ var _halide_buffer_is_bounds_query;
 var _halide_buffer_get_type;
 var _halide_buffer_init;
 var _halide_buffer_init_from_buffer;
+var _halide_buffer_crop;
 var _halide_buffer_set_bounds;
+var _halide_buffer_retire_crop_after_extern_stage;
+var _halide_buffer_retire_crops_after_extern_stage;
 
 if (typeof(_halide_buffer_get_dimensions) !== "function" ||
   typeof(_halide_buffer_get_host) !== "function" ||
@@ -315,6 +321,9 @@ if (typeof(_halide_buffer_get_dimensions) !== "function" ||
   typeof(_halide_buffer_get_type) !== "function" ||
   typeof(_halide_buffer_init) !== "function" ||
   typeof(_halide_buffer_init_from_buffer) !== "function" ||
+  typeof(_halide_buffer_crop) !== "function" ||
+  typeof(_halide_buffer_retire_crop_after_extern_stage) !== "function" ||
+  typeof(_halide_buffer_retire_crops_after_extern_stage) !== "function" ||
   typeof(_halide_buffer_set_bounds) !== "function") {
   (function () {
     // TODO: these are intended to be adequate standalone replacements
@@ -452,6 +461,21 @@ if (typeof(_halide_buffer_get_dimensions) !== "function" ||
         return dst;
     }
 
+    _halide_buffer_crop = function(user_context, dst, dst_shape, src, min, extent) {
+        halide_error(user_context, "TODO: _halide_buffer_crop is unimplemented");
+        return dst;
+    }
+
+    _halide_buffer_retire_crop_after_extern_stage = function(user_context, b) {
+        halide_error(user_context, "TODO: _halide_buffer_retire_crop_after_extern_stage is unimplemented");
+        return dst;
+    }
+
+    _halide_buffer_retire_crops_after_extern_stage = function(user_context, b) {
+        halide_error(user_context, "TODO: _halide_buffer_retire_crops_after_extern_stage is unimplemented");
+        return dst;
+    }
+
     _halide_buffer_set_bounds = function(buf, d, min, extent) {
         var stride = buf.dim[d].stride
         // Make a copy in case dim is shared
@@ -496,72 +520,41 @@ string CodeGen_JavaScript::make_js_int_cast(const string &value, const Type &src
         return value;
     }
 
-    const char *mask = nullptr;
-    switch (dst.bits()) {
-    case 1:
-        mask = "1";
-        break;
-    case 8:
-        mask = "0xff";
-        break;
-    case 16:
-        mask = "0xffff";
-        break;
-    case 32:
-        mask = "0xffffffff";
-        break;
-    default:
-        internal_error << "Unknown bit width (" << dst.bits() << ") making JavaScript cast.\n";
-        break;
-    }
+    internal_assert(dst.bits() != 64) << "Unknown bit width (" << dst.bits() << ") making JavaScript cast.\n";
+    const uint64_t mask = (1LL << dst.bits()) - 1;
 
-    string masked = print_assignment(Int(32), value + " & " + mask);
-    if (dst.is_uint()) {
-        return print_assignment(dst, masked);
-    }
-
-    // If dst is signed, we need to propagate the sign bit
     string shift_op = dst.is_uint() ? ">>>" : ">>";
     string shift_amount = std::to_string(32 - dst.bits());
-    return print_assignment(dst, "(" + masked + " << " + shift_amount + ") " + shift_op + " " + shift_amount);
+    ostringstream rhs;
+    rhs << "(" << "(" << value << " & 0x" << std::hex << mask << ")" << " << " << shift_amount << ") " << shift_op << " " << shift_amount;
+    return print_assignment(dst, rhs.str());
 }
 
-string javascript_type_array_name_fragment(const Type &type) {
-    string typed_array_name;
-    if (type.is_float()) {
-        if (type.bits() == 32) {
-            typed_array_name = "Float32";
-        } else if (type.bits() == 64) {
-            typed_array_name = "Float64";
-        } else {
-            user_error << "Only 32-bit and 64-bit floating-point types are supported in JavaScript.\n";
-        }
-    } else {
-        if (type.is_uint()) {
-            typed_array_name = "Ui";
-        } else {
-            typed_array_name = "I";
-        }
-        switch (type.bits()) {
-            case 1:
-            case 8:
-              typed_array_name += "nt8";
-              break;
-            case 16:
-              typed_array_name += "nt16";
-              break;
-            case 32:
-              typed_array_name += "nt32";
-              break;
-            case 64:
-              user_error << "64-bit integers are not supported in JavaScript.\n";
-              break;
-            default:
-              internal_error << "Array fragment name requested for unsupported type " << type << "\n";
-              break;
-        }
+inline constexpr int halide_type_code(halide_type_code_t code, int bits) {
+  return ((int) code) | (bits << 8);
+}
+
+const char *javascript_type_array_name_fragment(const Type &type) {
+
+    #define HANDLE_CASE(CODE, BITS, NAME) \
+        case halide_type_code(CODE, BITS): return NAME;
+
+    switch (halide_type_code(type.code(), type.bits())) {
+        HANDLE_CASE(halide_type_float, 32, "Float32")
+        HANDLE_CASE(halide_type_float, 64, "Float64")
+        HANDLE_CASE(halide_type_int, 8, "Int8")
+        HANDLE_CASE(halide_type_int, 16, "Int16")
+        HANDLE_CASE(halide_type_int, 32, "Int32")
+        HANDLE_CASE(halide_type_uint, 1, "Uint8")
+        HANDLE_CASE(halide_type_uint, 8, "Uint8")
+        HANDLE_CASE(halide_type_uint, 16, "Uint16")
+        HANDLE_CASE(halide_type_uint, 32, "Uint32")
+        default:
+            user_error << "Unsupported array type:" << type << "\n";
+            return "";
     }
-    return typed_array_name;
+
+    #undef HANDLE_CASE
 }
 
 Expr conditionally_extract_lane(Expr e, int lane) {
@@ -599,8 +592,8 @@ string CodeGen_JavaScript::print_reinterpret(Type type, Expr e) {
                 string dataview = unique_name('_');
                 do_indent();
                 stream << "var " << dataview << " = new DataView(new ArrayBuffer(" << bytes_needed << "));\n";
-                string setter = "set" + javascript_type_array_name_fragment(e.type());
-                string getter = "get" + javascript_type_array_name_fragment(type);
+                string setter = string("set") + javascript_type_array_name_fragment(e.type());
+                string getter = string("get") + javascript_type_array_name_fragment(type);
                 string val = print_expr(conditionally_extract_lane(e, lane));
                 do_indent();
                 stream << dataview << "." << setter << "(0, " << val << ", true);\n";
@@ -937,7 +930,7 @@ void CodeGen_JavaScript::visit(const Cast *op) {
 }
 
 void CodeGen_JavaScript::visit_binop(const Type &t, Expr a, Expr b,
-                                     const char *op, const char *simd_js_op) {
+                                     const char *op, const char *simd_js_op, const Type &op_result_type) {
     ostringstream rhs;
     std::string simd_js_type;
     if (simd_js_type_for_type(t, simd_js_type)) {
@@ -949,10 +942,15 @@ void CodeGen_JavaScript::visit_binop(const Type &t, Expr a, Expr b,
         const char *lead_char = (t.lanes() != 1) ? "[" : "";
 
         internal_assert(t.lanes() > 0);
+        const Type element_type = t.element_of();
         for (int lane = 0; lane < t.lanes(); lane++) {
             string sa = print_expr(conditionally_extract_lane(a, lane));
             string sb = print_expr(conditionally_extract_lane(b, lane));
-            rhs << lead_char << fround_start_if_needed(t) << sa << " " << op << " " << sb << fround_end_if_needed(t);
+            string val = print_assignment(element_type, sa + " " + op + " " + sb);
+            if (!op_result_type.is_handle() && (element_type.is_int() || element_type.is_uint())) {
+                val = make_js_int_cast(val, op_result_type, element_type);
+            }
+            rhs << lead_char << fround_start_if_needed(t) << val << fround_end_if_needed(t);
             lead_char = ", ";
         }
         if (t.lanes() > 1) {
@@ -963,10 +961,7 @@ void CodeGen_JavaScript::visit_binop(const Type &t, Expr a, Expr b,
 }
 
 void CodeGen_JavaScript::visit(const Add *op) {
-    visit_binop(op->type, op->a, op->b, "+", "add");
-    if (!op->type.is_float()) {
-        make_js_int_cast(id, Float(64), op->type);
-    }
+    visit_binop(op->type, op->a, op->b, "+", "add", Float(64));
 }
 
 void CodeGen_JavaScript::visit(const Sub *op) {
@@ -975,17 +970,14 @@ void CodeGen_JavaScript::visit(const Sub *op) {
         string arg = print_expr(op->b);
         print_assignment(op->type, simd_js_type + ".neg(" + arg + ")");
     } else {
-        visit_binop(op->type, op->a, op->b, "-", "sub");
-        if (!op->type.is_float()) {
-            make_js_int_cast(id, Float(64), op->type);
-        }
+        visit_binop(op->type, op->a, op->b, "-", "sub", Float(64));
     }
 }
 
 void CodeGen_JavaScript::visit(const Mul *op) {
     std::string simd_js_type;
     if (op->type.is_float() || simd_js_type_for_type(op->type, simd_js_type)) {
-        visit_binop(op->type, op->a, op->b, "*", "mul");
+        visit_binop(op->type, op->a, op->b, "*", "mul", Float(64));
     } else {
         ostringstream rhs;
         const char *lead_char = (op->type.lanes() != 1) ? "[" : "";
@@ -1322,15 +1314,15 @@ void CodeGen_JavaScript::visit(const Call *op) {
         rhs << ", " << buffer << ")";
     } else if (op->is_intrinsic(Call::bitwise_and)) {
         internal_assert(op->args.size() == 2);
-        visit_binop(op->type, op->args[0], op->args[1], "&", "and");
+        visit_binop(op->type, op->args[0], op->args[1], "&", "and", Int(32));
         rhs << id;
     } else if (op->is_intrinsic(Call::bitwise_xor)) {
         internal_assert(op->args.size() == 2);
-        visit_binop(op->type, op->args[0], op->args[1], "^", "xor");
+        visit_binop(op->type, op->args[0], op->args[1], "^", "xor", Int(32));
         rhs << id;
     } else if (op->is_intrinsic(Call::bitwise_or)) {
         internal_assert(op->args.size() == 2);
-        visit_binop(op->type, op->args[0], op->args[1], "|", "or");
+        visit_binop(op->type, op->args[0], op->args[1], "|", "or", Int(32));
         rhs << id;
     } else if (op->is_intrinsic(Call::bitwise_not)) {
         internal_assert(op->args.size() == 1);
@@ -1339,7 +1331,7 @@ void CodeGen_JavaScript::visit(const Call *op) {
         if (simd_js_type_for_type(op->type, simd_js_type)) {
             rhs << simd_js_type << ".not(" << a << ")";
         } else {
-            rhs << "~" << a;
+            rhs << make_js_int_cast("~" + a, Int(32), op->type);
         }
     } else if (op->is_intrinsic(Call::reinterpret)) {
         internal_assert(op->args.size() == 1);
@@ -1602,11 +1594,8 @@ void CodeGen_JavaScript::visit(const Call *op) {
             call && call->is_intrinsic(Call::size_of_halide_buffer_t)) {
             rhs << "_halide_buffer_create()";
         } else {
-            const int bytes = op->type.bytes();
-            do_indent();
-            string alloc_size = print_expr(simplify((op->args[0] + Expr(bytes) - 1) / bytes));
-            string typed_array_name = javascript_type_array_name_fragment(op->type) + "Array";
-            rhs << "new " << typed_array_name << "(" << alloc_size << ")";
+            string alloc_size = print_expr(simplify(op->args[0]));
+            rhs << "new Uint8Array(" << alloc_size << ")";
         }
 
         // don't fall thru and call print_assignment: it could re-use
@@ -1902,7 +1891,7 @@ void CodeGen_JavaScript::visit(const Allocate *op) {
         do_indent();
         stream << "var " << op_name << " = (" << alloc_expr << ");\n";
     } else {
-        string typed_array_name = javascript_type_array_name_fragment(op->type) + "Array";
+        string typed_array_name = javascript_type_array_name_fragment(op->type) + string("Array");
         std::string allocation_size;
         int32_t constant_size = op->constant_allocation_size();
         // This both potentially does strength reduction at compile time, but also handles the zero extents case.
